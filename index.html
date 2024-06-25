@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+        }
+
+        canvas {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="canvas" tabindex="0"></canvas>
+</body>
+
+<script type="module">
+    // Boilerplate code ////////////////////////////////////////////////////////
+
+    import * as glance from "../glance/js/index.js";
+    const { Vec2, Vec3, Mat3, Mat4 } = glance;
+
+    // Get the WebGL context
+    const canvas = document.getElementById('canvas');
+    const gl = glance.getContext(canvas, { antialias: true });
+
+    // Basic render loop wrapper.
+    function setRenderLoop(callback) {
+        function renderLoop(time) {
+            callback(time);
+            requestAnimationFrame(renderLoop);
+        }
+        requestAnimationFrame(renderLoop);
+    }
+
+    // Resize callback
+    let _resizeCallback = null;
+    function onResizeInternal() {
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        canvas.width = width;
+        canvas.height = height;
+        gl.viewport(0, 0, width, height);
+        if (_resizeCallback) {
+            _resizeCallback(width, height);
+        }
+    }
+    onResizeInternal();
+    window.addEventListener("resize", onResizeInternal);
+    function onResize(callback) {
+        _resizeCallback = callback;
+        _resizeCallback(window.innerWidth, window.innerHeight);
+    }
+
+    // Mouse event handling
+    function onMouseDrag(callback) {
+        let isDragging = null;
+        canvas.addEventListener("mousedown", () => {
+            isDragging = true;
+        });
+        canvas.addEventListener("mousemove", (e) => {
+            if (isDragging) {
+                callback(e);
+            }
+        });
+        canvas.addEventListener("mouseup", () => {
+            isDragging = false;
+        });
+    }
+
+    function onMouseWheel(callback) {
+        canvas.addEventListener("wheel", (e) => {
+            e.preventDefault();
+            callback(e);
+        });
+    }
+
+    // Keyboard event handling
+    function onKeyDown(callback) {
+        window.addEventListener("keydown", (e) => {
+            callback(e);
+        });
+    }
+    function onKeyUp(callback) {
+        window.addEventListener("keyup", (e) => {
+            callback(e);
+        });
+    }
+
+    // Game Code Start /////////////////////////////////////////////////////////
+
+    // =====================================================================
+    // Game Constants
+    // =====================================================================
+
+    // Globals
+    // const origin = Vec3.zero();
+    // const up = Vec3.yAxis();
+
+    // Camera settings
+    const fov = Math.PI / 4;
+    const nearPlane = 0.4;
+    const farPlane = 60;
+    const cameraFocus = new Vec3(0, 0, 0);
+    const cameraSpeed = 0.001;
+    const zoomSpeed = 0.025;
+    const minZoom = 5.0;
+    const maxZoom = 30;
+    // const lightDirection = new Vec3(0, 0, 1).normalize();
+
+    // Scene settings
+    const groundOffset = -1.5;
+    // const statueOffset = -0.75;
+    // const statueRotation = Math.PI;
+    const terrainSize = 5;
+    const boxSize = 2.0;
+    const boxSpeed = 0.004;
+
+    // noise function settings
+    const noiseScaleX = 1 / 8;
+    const noiseScaleY = 1 / 4;
+    const noiseScaleZ = 0.47;
+    const noiseSpeed = 0.0001;
+    const noiseSeed = 123;
+
+    // Light settings
+    const lightProjection = Mat4.ortho(-terrainSize*2, terrainSize*2, -terrainSize*2, terrainSize*2, 2, 10.0); //(-0.5, 0.5, -0.8, 0.95, 0.3, 4.1)
+    const lightRotationSpeed = 0.001;
+    const lightTilt = Math.PI / -8;
+
+    // lightProjection.perspective(fov,gl.canvas.width / gl.canvas.height, nearPlane, farPlane);
+    // =====================================================================
+    // Game State
+    // =====================================================================
+
+    // The user can orbit the camera around the world origin and zoom in and out.
+    let pan = Math.PI;
+    let tilt = -0.1;
+    let zoom = 7.0;
+    onMouseDrag((e) => {
+        pan -= e.movementX * cameraSpeed;
+        tilt = glance.clamp(tilt - e.movementY * cameraSpeed, Math.PI / -2, Math.PI / 2);
+    });
+
+    onMouseWheel((e) => {
+        const factor = 1 + Math.sign(e.deltaY) * zoomSpeed;
+        zoom = glance.clamp(zoom * factor, minZoom, maxZoom);
+    });
+
+    /// Resizing the viewport will update the projection matrix.
+    const projectionMatrix = Mat4.perspective(fov, gl.canvas.width / gl.canvas.height, nearPlane, farPlane);
+    onResize(() => {
+        projectionMatrix.perspective(fov, gl.canvas.width / gl.canvas.height, nearPlane, farPlane);
+    });
+
+    // These variables are used by the draw calls.
+    // They will be updated in the render loop.
+    const boxPos = Vec3.zero();
+    const boxRot = Vec3.zero();
+    const viewPos = Vec3.zero();
+    const viewMatrix = Mat4.identity();
+
+    // Variables for the light
+    const lightPos = Vec3.zero();
+    const lightXform = Mat4.identity();
+
+    /// The user can move a box around in the terrain.
+    let boxDelta = Vec3.zero();
+    let boxFlip = Vec3.zero();
+    const flipRatio = Math.PI / 4;
+
+    // controlling box
+    onKeyDown((e) => {
+        if (e.key === "w") {
+            boxDelta.y = Math.max(boxDelta.y - 1, -1);
+        } else if (e.key === "s") {
+            boxDelta.y = Math.min(boxDelta.y + 1, 1);
+        } else if (e.key === "a") {
+            boxDelta.x = Math.max(boxDelta.x - 1, -1);
+        } else if (e.key === "d") {
+            boxDelta.x = Math.min(boxDelta.x + 1, 1);
+        } else if (e.key === "x") {
+            boxDelta.z = Math.max(boxDelta.z - 1, -1);
+        } else if (e.key === "e") {
+            boxDelta.z = Math.min(boxDelta.z + 1, 1);
+        }
+        else if (e.key === "i") {
+            boxFlip.y = Math.max(boxFlip.y - 1, -1);
+        } else if (e.key === "k") {
+            boxFlip.y = Math.min(boxFlip.y + 1, 1);
+        } else if (e.key === "j") {
+            boxFlip.x = Math.max(boxFlip.x - 1, -1);
+        } else if (e.key === "l") {
+            boxFlip.x = Math.min(boxFlip.x + 1, 1);
+        } else if (e.key === "m") {
+            boxFlip.z = Math.max(boxFlip.z - 1, -1);
+        } else if (e.key === "u") {
+            boxFlip.z = Math.min(boxFlip.z + 1, 1);
+        }
+    });
+
+    onKeyUp((e) => {
+        if (e.key === "w") {
+            boxDelta.y = Math.min(boxDelta.y + 1, 1);
+        } else if (e.key === "s") {
+            boxDelta.y = Math.max(boxDelta.y - 1, -1);
+        } else if (e.key === "a") {
+            boxDelta.x = Math.min(boxDelta.x + 1, 1);
+        } else if (e.key === "d") {
+            boxDelta.x = Math.max(boxDelta.x - 1, -1);
+        } else if (e.key === "x") {
+            boxDelta.z = Math.min(boxDelta.z + 1, 1);
+        } else if (e.key === "e") {
+            boxDelta.z = Math.max(boxDelta.z - 1, -1);
+        }
+        else if (e.key === "i") {
+            boxFlip.y = Math.min(boxFlip.y + 1, 1);
+        } else if (e.key === "k") {
+            boxFlip.y = Math.max(boxFlip.y - 1, -1);
+        } else if (e.key === "j") {
+            boxFlip.x = Math.min(boxFlip.x + 1, 1);
+        } else if (e.key === "l") {
+            boxFlip.x = Math.max(boxFlip.x - 1, -1);
+        } else if (e.key === "m") {
+            boxFlip.z = Math.min(boxFlip.z + 1, 1);
+        } else if (e.key === "u") {
+            boxFlip.z = Math.max(boxFlip.z - 1, -1);
+        }
+    });
+    // =====================================================================
+    // Shadow Depth Texture
+    // =====================================================================
+
+    const shadowDepthTexture = glance.createTexture(gl, "shadow-depth", 512, 512, gl.TEXTURE_2D, null, {
+        useAnisotropy: false,
+        internalFormat: gl.DEPTH_COMPONENT16,
+        levels: 1,
+        filter: gl.NEAREST,
+    });
+
+    // =====================================================================
+    // Skybox
+    // =====================================================================
+
+    /// This is the same skybox shader from the VAO/skybox lecture.
+    const skyboxVSSource = `#version 300 es
+        precision highp float;
+
+        uniform mat4 u_viewMatrix;
+        uniform mat4 u_projectionMatrix;
+
+        in vec3 a_pos;
+
+        out vec3 f_texCoord;
+
+        void main() {
+            f_texCoord = a_pos;
+            vec4 ndcPos = u_projectionMatrix * u_viewMatrix * vec4(a_pos, 0.0);
+            gl_Position = ndcPos.xyww;
+        }
+    `;
+    const skyboxFSSource = `#version 300 es
+        precision mediump float;
+
+        uniform samplerCube u_skybox;
+
+        in vec3 f_texCoord;
+
+        out vec4 o_fragColor;
+
+        void main() {
+            o_fragColor = texture(u_skybox, f_texCoord);
+        }
+    `;
+    const skyboxShader = glance.createShader(gl,
+        "skybox-shader",
+        skyboxVSSource,
+        skyboxFSSource,
+        {
+            u_skybox: 0, // read the skybox from texture unit 0
+        }
+    );
+
+    /// Create the skybox geometry.
+    const skyboxGeo = glance.createBox("skybox-geo");
+    const skyboxIBO = glance.createIndexBuffer(gl, skyboxGeo.indices);
+    const skyboxABO = glance.createAttributeBuffer(gl, "skybox-abo", {
+        a_pos: { data: skyboxGeo.positions, height: 3 },
+    });
+    const skyboxVAO = glance.createVAO(
+        gl,
+        "skybox-vao",
+        skyboxIBO,
+        glance.buildAttributeMap(skyboxShader, [skyboxABO]),
+    );
+
+    /// Load the skybox texture.
+    const skyboxTexture = await glance.loadCubemapNow(gl, "skybox-texture", [
+        './images/skybox/night-right.png',
+        './images/skybox/night-left.png',
+        './images/skybox/night-top.png',
+        './images/skybox/night-bottom.png',
+        './images/skybox/night-front.png',
+        './images/skybox/night-back.png',
+    ]);
+
+    /// The draw call contains all information on how to render the skybox.
+    const skyboxDrawCall = glance.createDrawCall(gl, skyboxShader, skyboxVAO, {
+        uniforms: {
+            u_viewMatrix: () => viewMatrix,
+            u_projectionMatrix: () => projectionMatrix,
+        },
+        textures: [
+            [0, skyboxTexture], // bind the skybox texture to texture unit 0
+        ],
+        cullFace: gl.NONE,
+        depthTest: gl.LEQUAL,
+    });
+
+
+    // =====================================================================
+    // Box
+    // =====================================================================
+
+
+    /// The box shader is a basic Blinn-Phong shader with a single light source.
+    const boxVSSource = `#version 300 es
+        precision highp float;
+
+        uniform mat4 u_modelMatrix;
+        uniform mat4 u_viewMatrix;
+        uniform mat4 u_projectionMatrix;
+
+        uniform vec3 u_viewPosition;
+        uniform mat4 u_lightProjection; 
+        uniform vec3 u_lightPosition;
+        uniform mat4 u_lightXform;
+
+        in vec3 a_pos;
+        in vec3 a_normal;
+
+        out vec3 f_fragPosWS;
+        out vec3 f_viewPosWS;
+        out vec3 f_lightDirWS;
+        out vec3 f_normalWS;
+        out vec4 f_fragPosLS;
+
+        void main() {
+            vec4 worldPosition = u_modelMatrix * vec4(a_pos, 1.0);
+            gl_Position = u_projectionMatrix * u_viewMatrix * worldPosition;
+
+            f_fragPosWS = worldPosition.xyz;
+            f_viewPosWS = u_viewPosition;
+            f_normalWS = normalize(mat3(u_modelMatrix) * a_normal);
+            f_lightDirWS = normalize(u_lightPosition);
+
+            f_fragPosLS = u_lightProjection * u_lightXform * worldPosition;
+        }
+    `;
+    const boxFSSource = `#version 300 es
+        precision mediump float;
+
+        uniform float u_ambient;
+        uniform float u_diffuse;
+        uniform float u_specular;
+        uniform float u_shininess;
+        uniform float u_reflectionIntensity;
+        uniform vec3 u_lightColor;
+        uniform vec3 u_color;
+        uniform samplerCube u_skybox;
+        uniform sampler2D u_texShadow;
+
+        in vec3 f_fragPosWS;
+        in vec3 f_viewPosWS;
+        in vec3 f_lightDirWS;
+        in vec3 f_normalWS;
+        in vec4 f_fragPosLS;
+
+        out vec4 o_fragColor;
+        
+        float calculateShadow();
+
+        void main() {
+            // lighting
+            vec3 viewDirection = normalize(f_viewPosWS - f_fragPosWS);
+            vec3 halfWay = normalize(viewDirection + f_lightDirWS);
+
+            // lighting
+            vec3 ambient = u_ambient * u_color;
+
+            // diffuse
+            float diffuseIntensity = max(dot(f_normalWS, f_lightDirWS), 0.0);
+            vec3 diffuse = diffuseIntensity * u_lightColor * u_diffuse;
+
+            // specular
+            float specularIntensity = pow(max(dot(f_normalWS, halfWay), 0.0), u_shininess);
+            vec3 specular =  specularIntensity * u_lightColor * u_specular;
+            // vec3 specular =  * vec3(u_specular);
+
+            // shadow
+            float shadow = calculateShadow();
+
+            // reflection 
+            vec3 reflectionDirection = reflect(-viewDirection, f_normalWS);
+            vec3 reflection = texture(u_skybox, reflectionDirection).rgb;
+
+            o_fragColor = vec4(ambient + shadow * (diffuse + specular +(reflection*u_reflectionIntensity)), 1.0);
+        }
+
+        float calculateShadow() {
+            // Perspective divide.
+            vec3 projCoords = f_fragPosLS.xyz / f_fragPosLS.w;
+
+            // Transform to [0,1] range.
+            projCoords = projCoords * 0.5 + 0.5;
+
+            // No shadow for fragments outside of the light's frustum.
+            if(any(lessThan(projCoords, vec3(0))) || any(greaterThan(projCoords, vec3(1)))){
+                return 1.0;
+            }
+
+            float bias = 1.0/100.0;
+            float closestDepth = texture(u_texShadow, projCoords.xy).r;
+            return projCoords.z - bias > closestDepth  ? 0.0 : 1.0;
+        }
+    `;
+
+    const boxShader = glance.createShader(gl, "box-shader", boxVSSource, boxFSSource, {
+        u_lightProjection: lightProjection,
+        u_ambient: 0.5,
+        u_diffuse: 0.5,
+        u_specular: 1.0,
+        u_shininess: 8.0,
+        u_reflectionIntensity: 1,
+        u_lightColor: [0.6705882353, 0.1450980392, 0.1411764706],
+        u_color: [0.1568627451, 0.4470588235, 0.2],
+        u_texShadow: 0,
+        u_skybox: 1,
+    });
+
+
+    const boxGeo = await glance.loadObj('/objects/Tetris_Box.obj');
+    const boxIBO = glance.createIndexBuffer(gl, boxGeo.indices);
+    const boxABO = glance.createAttributeBuffer(gl, "box-abo", {
+        a_pos: { data: boxGeo.positions, height: 3 },
+        a_normal: { data: boxGeo.normals, height: 3 },
+    });
+    const boxVAO = glance.createVAO(gl, "box-vao", boxIBO, glance.buildAttributeMap(boxShader, [boxABO]));
+
+    const boxDrawCall = glance.createDrawCall(gl, boxShader, boxVAO, {
+        uniforms: {
+            // u_time: ({ time }) => time,
+            u_modelMatrix: () => Mat4.fromTranslation(boxPos).rotateX(boxRot.x).rotateY(boxRot.y).rotateZ(boxRot.z),
+            u_viewMatrix: () => viewMatrix,
+            u_projectionMatrix: () => projectionMatrix,
+            u_viewPosition: () => viewPos,
+            u_lightPosition: () => lightPos,
+            u_lightXform: () => lightXform,
+        },
+        textures: [
+            [0, shadowDepthTexture],
+            [1, skyboxTexture]
+        ],
+        cullFace: gl.BACK,
+        depthTest: gl.LESS,
+        // blendFunc: [gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA]
+    });
+
+    // =====================================================================
+    // Terrain
+    // =====================================================================
+
+    /// If a JavaScript number happens to be an integer, it is printed like an
+    /// integer, so "1" instead of "1.0". This will break the GLSL code which makes
+    /// a hard distinction between integers and floats. To avoid this, we can use
+    /// the 'float' function to force the number to be printed as a float.
+    const float = (x) => x.toExponential();
+
+    /// Load the OpenSimplex2S noise function as a code snippet to inject into
+    /// the terrain vertex shader.
+    /// The workings of the simplex noise are not important for this lecture.
+    const openSimplex2S = await glance.loadCodeSnippet(
+        "./OpenSimplex2S.glsl"
+    );
+
+    const terrainVSSource = `#version 300 es
+        precision highp float;
+
+        uniform mat4 u_modelMatrix;
+        uniform mat4 u_viewMatrix;
+        uniform mat4 u_projectionMatrix;
+        uniform vec3 u_viewPosition;
+        uniform mat4 u_lightProjection;
+        uniform vec3 u_lightPosition;
+        uniform mat4 u_lightXform;
+        uniform mediump float u_time;
+
+        in vec3 a_pos;
+        in vec3 a_normal;
+
+        out vec3 f_fragPosWS;
+        out vec3 f_viewPosWS;
+        out vec3 f_lightDirWS;
+        out vec3 f_normalWS;
+        out vec4 f_fragPosLS;
+
+        // This gives us a function called 'openSimplex2SDerivatives_ImproveXY' which
+        // returns the derivatives of the noise function in the xyz and the height in w.
+        
+        ${openSimplex2S}
+        void main() {
+
+            vec3 noiseSamplePos = vec3(
+                a_pos.x * ${float(noiseScaleX)},
+                a_pos.y * ${float(noiseScaleY)} + u_time * ${float(noiseSpeed * 8)},
+                ${float(noiseSeed)}
+            );
+            vec3 noiseSamplePos2 = vec3(
+                a_pos.x * ${float(noiseScaleX * 8)},
+                a_pos.y * ${float(noiseScaleY * 4)} + u_time * ${float(noiseSpeed)},
+                ${float(noiseSeed)}
+            );
+            vec4 noiseResult = openSimplex2SDerivatives_ImproveXY((noiseSamplePos));
+            vec4 noiseResult2 = openSimplex2SDerivatives_ImproveXY((noiseSamplePos2));
+
+            vec4 worldPosition = u_modelMatrix * vec4(a_pos.xy, a_pos.z + (noiseResult.w * noiseResult2.w) * ${float(noiseScaleZ)}, 1.0);
+            vec4 normal = u_modelMatrix * vec4(noiseResult.xyz*noiseResult2.xyz * ${float(noiseScaleZ)}, 0.0);
+            gl_Position = u_projectionMatrix * u_viewMatrix * worldPosition;
+
+            f_fragPosWS = worldPosition.xyz;
+            f_viewPosWS = u_viewPosition;
+            f_normalWS = normalize(mat3(u_modelMatrix) * normal.xyz);
+            f_lightDirWS = normalize(u_lightPosition);
+
+            f_fragPosLS = u_lightProjection * u_lightXform * worldPosition;
+        }
+    `;
+
+    const terrainFSSource = `#version 300 es
+        precision mediump float;
+
+        uniform float u_time;
+        uniform float u_ambient;
+        uniform float u_diffuse;
+        uniform float u_specular;
+        uniform float u_shininess;
+        uniform float u_reflectionIntensity;
+        uniform vec3 u_lightColor;
+        uniform vec3 u_color;
+        uniform vec3 u_viewPosition;
+        uniform sampler2D u_texShadow;
+        uniform samplerCube u_skybox;
+
+        in vec3 f_fragPosWS;
+        in vec3 f_viewPosWS;
+        in vec3 f_lightDirWS;
+        in vec3 f_normalWS;
+        in vec4 f_fragPosLS;
+
+        out vec4 o_fragColor;
+
+        float calculateShadow();
+
+        void main() {
+
+        // lighting
+            vec3 viewDirection = normalize(f_viewPosWS - f_fragPosWS);
+            vec3 halfWay = normalize(viewDirection + f_lightDirWS);
+
+            // lighting
+            vec3 ambient = u_ambient * u_color;
+
+            // diffuse
+            float diffuseIntensity = max(dot(f_normalWS, f_lightDirWS), 0.0);
+            vec3 diffuse = diffuseIntensity * u_lightColor * u_diffuse;
+
+            // specular
+            float specularIntensity = pow(max(dot(f_normalWS, halfWay), 0.0), u_shininess);
+            vec3 specular =  specularIntensity * u_lightColor * u_specular;
+            // vec3 specular =  * vec3(u_specular);
+
+            // shadow
+            float shadow = calculateShadow();
+
+            // reflection 
+            vec3 reflectionDirection = reflect(-viewDirection, f_normalWS);
+            vec3 reflection = texture(u_skybox, reflectionDirection).rgb;
+
+            o_fragColor = vec4(ambient + shadow * (diffuse + specular +(reflection*u_reflectionIntensity)), 0.65);
+
+        }
+
+        float calculateShadow() {
+        // Perspective divide.
+        vec3 projCoords = f_fragPosLS.xyz / f_fragPosLS.w;
+
+        // Transform to [0,1] range.
+        projCoords = projCoords * 0.5 + 0.5;
+
+        // No shadow for fragments outside of the light's frustum.
+        if(any(lessThan(projCoords, vec3(0))) || any(greaterThan(projCoords, vec3(1)))){
+            return 1.0;
+        }
+
+        float bias = 0.005;
+        float closestDepth = texture(u_texShadow, projCoords.xy).r;
+        return projCoords.z - bias > closestDepth  ? 0.0 : 1.0;
+    }
+    `;
+    const terrainShader = glance.createShader(gl, "terrain-shader", terrainVSSource, terrainFSSource, {
+        u_modelMatrix: Mat4.fromTranslationY(groundOffset).rotateX(Math.PI / -2),
+        u_lightProjection: lightProjection,
+        u_ambient: 0.05,
+        u_diffuse: 0.1,
+        u_specular: 0.5,
+        u_shininess: 8.0,
+        u_reflectionIntensity: 1.0,
+        u_lightColor: [0.6705882353, 0.1450980392, 0.1411764706],
+        u_color: [0.5098039216, 0.9137254902, 1.0],
+        u_texShadow: 0,
+        u_skybox: 1,
+    });
+
+    const terrainGeo = glance.createPlane("terrain-geo", {
+        width: terrainSize,
+        height: terrainSize,
+        widthSegments: 512,
+        heightSegments: 512,
+    });
+    const terrainIBO = glance.createIndexBuffer(gl, terrainGeo.indices);
+    const terrainABO = glance.createAttributeBuffer(gl, "terrain-abo", {
+        a_pos: { data: terrainGeo.positions, height: 3 },
+        a_normal: { data: terrainGeo.normals, height: 3 }
+    });
+    const terrainVAO = glance.createVAO(
+        gl,
+        "terrain-vao",
+        terrainIBO,
+        glance.buildAttributeMap(terrainShader, [terrainABO]),
+    );
+
+
+    const terrainDrawCall = glance.createDrawCall(gl, terrainShader, terrainVAO, {
+        uniforms: {
+            u_time: ({ time }) => time,
+            u_viewMatrix: () => viewMatrix,
+            u_projectionMatrix: () => projectionMatrix,
+            u_viewPosition: () => viewPos,
+            u_lightPosition: () => lightPos,
+            u_lightXform: () => lightXform,
+        },
+
+        textures: [
+            [0, shadowDepthTexture],
+            [1, skyboxTexture]
+        ],
+        cullFace: gl.BACK,
+        depthTest: gl.LESS,
+        blendFunc: [gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA]
+    });
+
+
+
+    // =====================================================================
+    // Shadow Mapping
+    // =====================================================================
+
+    const shadowVSSource = `#version 300 es
+    precision highp float;
+
+    uniform mat4 u_modelMatrix;
+    uniform mat4 u_lightXform;
+    uniform mat4 u_lightProjection;
+
+    in vec3 a_pos;
+
+    void main()
+    {
+        gl_Position = u_lightProjection * u_lightXform * u_modelMatrix * vec4(a_pos, 1.0);
+    }
+`;
+
+    const shadowFSSource = `#version 300 es
+    precision mediump float;
+
+    void main() {}
+`;
+
+    const shadowShader = glance.createShader(gl, "shadow-shader", shadowVSSource, shadowFSSource, {
+        u_lightProjection: lightProjection,
+    });
+
+    const shadowFramebuffer = glance.createFramebuffer(gl, "shadow-framebuffer", null, shadowDepthTexture);
+
+    const shadowDrawCalls = [
+        glance.createDrawCall(gl, shadowShader, boxVAO, {
+            uniforms: {
+                u_modelMatrix: () => Mat4.fromTranslation(boxPos).rotateX(boxRot.x).rotateY(boxRot.y).rotateZ(boxRot.z),
+                u_lightXform: () => lightXform,
+            },
+            cullFace: gl.BACK,
+            depthTest: gl.LESS,
+        }),
+        glance.createDrawCall(gl, shadowShader, terrainVAO, {
+            uniforms: {
+                u_modelMatrix: () => Mat4.fromTranslationY(groundOffset).rotateX(Math.PI / -2),
+                u_lightXform: () => lightXform,
+            },
+            cullFace: gl.BACK,
+            depthTest: gl.LESS,
+        }),
+    ];
+
+    // =====================================================================
+    // Debug Screen
+    // =====================================================================
+
+    const debugShader = glance.createShader(gl, "debug-shader",
+        `#version 300 es
+    precision highp float;
+    in vec2 a_pos;
+    in vec2 a_texCoord;
+    out vec2 f_texCoord;
+    void main() {
+        f_texCoord = a_texCoord;
+        gl_Position = vec4(a_pos, 0.0, 1.0);
+    }
+`, `#version 300 es
+    precision mediump float;
+    uniform sampler2D u_texture;
+    in vec2 f_texCoord;
+    out vec4 o_fragColor;
+    void main() {
+        o_fragColor = vec4(vec3(texture(u_texture, f_texCoord).r), 1.0);
+    }
+`, {
+        u_texture: 0,
+    });
+
+    const debugGeo = glance.createScreenQuat("debug-geo", {
+        in2D: true,
+    });
+    const debugIBO = glance.createIndexBuffer(gl, debugGeo.indices);
+    const debugABO = glance.createAttributeBuffer(gl, "debug-abo", {
+        a_pos: { data: debugGeo.positions, height: 2 },
+        a_texCoord: { data: debugGeo.texCoords, height: 2 },
+    });
+    const debugVAO = glance.createVAO(gl, "debug-vao", debugIBO, glance.buildAttributeMap(debugShader, debugABO));
+
+    const debugDrawCall = glance.createDrawCall(gl, debugShader, debugVAO, {
+        textures: [[0, shadowDepthTexture]],
+        cullFace: gl.NONE,
+        depthTest: gl.NONE,
+    });
+    // =====================================================================
+    // Light Bulb
+    // =====================================================================
+
+    const bulbVSSource = `#version 300 es
+    precision highp float;
+
+    uniform mat4 u_modelMatrix;
+    uniform mat4 u_viewMatrix;
+    uniform mat4 u_projectionMatrix;
+
+    in vec3 a_pos;
+
+    void main() {
+        gl_Position = u_projectionMatrix * u_viewMatrix * u_modelMatrix * vec4(a_pos, 1.0);
+    }
+    `;
+    const bulbFSSource = `#version 300 es
+    precision mediump float;
+
+    out vec4 o_fragColor;
+
+    void main() {
+        o_fragColor = vec4(0.8705882353, 0.4450980392, 0.4411764706, 0.5);
+    }
+`;
+    const bulbShader = glance.createShader(gl, "bulb-shader", bulbVSSource, bulbFSSource);
+
+    const bulbGeo = glance.createSphere("bulb-geo", {
+        radius: 0.1,
+        widthSegments: 16,
+        heightSegments: 8,
+    });
+    const bulbIBO = glance.createIndexBuffer(gl, bulbGeo.indices);
+    const bulbABO = glance.createAttributeBuffer(gl, "bulb-abo", {
+        a_pos: { data: bulbGeo.positions, height: 3 },
+    });
+    const bulbVAO = glance.createVAO(gl, "bulb-vao", bulbIBO, glance.buildAttributeMap(bulbShader, [bulbABO]));
+
+    const bulbDrawCall = glance.createDrawCall(gl, bulbShader, bulbVAO, {
+        uniforms: {
+            u_modelMatrix: () => Mat4.fromTranslation(lightPos),
+            u_viewMatrix: () => viewMatrix,
+            u_projectionMatrix: () => projectionMatrix,
+        },
+        cullFace: gl.BACK,
+        depthTest: gl.LESS,
+        blendFunc: [gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA]
+    });
+
+
+    // =====================================================================
+    // Render Loop
+    // =====================================================================
+
+    const zeroVec = Vec3.zero();
+    const upVec = Vec3.yAxis();
+    let lastTime = -1;
+    // let deltaLight = Vec3.zero();
+
+    const framebufferStack = new glance.FramebufferStack();
+
+    setRenderLoop(() => {
+        const time = performance.now();
+        const rotateRatio = Math.PI / 6;
+        const deltaTime = lastTime >= 0 ? time - lastTime : 0;
+        lastTime = time;
+
+        // Update the view
+        viewPos.set(0, 0, zoom).rotateX(tilt).rotateY(pan).add(cameraFocus);
+        viewMatrix.lookAt(viewPos, cameraFocus, upVec);
+
+        // Update the box rotation
+        boxRot.x += boxFlip.x * deltaTime * boxSpeed * 0.125;
+        boxRot.y += boxFlip.y * deltaTime * boxSpeed * 0.125;
+        boxRot.z += boxFlip.z * deltaTime * boxSpeed * 0.125;
+        // Update the box position
+        boxPos.x += boxDelta.x * deltaTime * boxSpeed;
+        boxPos.z += boxDelta.y * deltaTime * boxSpeed;
+        boxPos.y += boxDelta.z * deltaTime * boxSpeed;
+        // autmoatic rotation
+        boxRot.x += Math.sin(deltaTime * boxSpeed * 0.05);
+        boxRot.y += Math.sin(deltaTime * boxSpeed * 0.05);
+        // clamp to terrain size
+        boxPos.x = glance.clamp(boxPos.x, -terrainSize, terrainSize);
+        boxPos.z = glance.clamp(boxPos.z, -terrainSize, terrainSize);
+        boxPos.y = glance.clamp(boxPos.y, -1.0, terrainSize);
+
+        // Update the light
+        lightPos
+            .set(0, 0, 2) // moving radius
+            .rotateX(lightTilt) // up
+            .rotateY(time * lightRotationSpeed)
+            .rotateZ(time * lightRotationSpeed * 0.5)
+            .add(new Vec3(0, 4, 0)) // transpose up
+            .add(boxPos); // clamp boxPos
+        // .lerp(deltaLight, 0.1);
+        lightXform.lookAt(lightPos, cameraFocus, upVec);
+
+        
+
+        // render shadow
+        framebufferStack.push(gl, shadowFramebuffer);
+        {
+            gl.clear(gl.DEPTH_BUFFER_BIT);
+            for (const drawCall of shadowDrawCalls) {
+                glance.performDrawCall(gl, drawCall, time);
+            }
+        }
+        framebufferStack.pop(gl);
+
+        // Render the image
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        glance.performDrawCall(gl, skyboxDrawCall, time);
+        if (0) {
+            glance.performDrawCall(gl, debugDrawCall, time);
+        } else {
+            glance.performDrawCall(gl, boxDrawCall, time);
+            glance.performDrawCall(gl, terrainDrawCall, time);
+            glance.performDrawCall(gl, bulbDrawCall, time);
+            
+        }
+        // deltaLight = lightPos;
+    });
+
+    // Game Code End ///////////////////////////////////////////////////////////
+</script>
+
+</html>
